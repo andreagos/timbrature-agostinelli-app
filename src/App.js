@@ -737,7 +737,7 @@ function ManagerView({ entries, employees }) {
       <div style={S.eyebrow}>ACCESSO MANAGER</div>
       <p style={{ color: C.textSub, fontSize: 13, marginBottom: 20 }}>Inserisci il PIN per accedere al pannello</p>
       
-      <input type="password" maxLength={4} value={pin} onChange={e => setPin(e.target.value)} onKeyDown={e => e.key === "Enter" && check()} placeholder="• • • •" style={{ ...S.input, textAlign: "center", fontSize: 30, letterSpacing: 14 }} />
+      <input type="password" maxLength={6} value={pin} onChange={e => setPin(e.target.value)} onKeyDown={e => e.key === "Enter" && check()} placeholder="• • • •" style={{ ...S.input, textAlign: "center", fontSize: 30, letterSpacing: 14 }} />
       {pinErr && <div style={{ color: C.danger, fontSize: 12, marginTop: 8 }}>PIN errato</div>}
       <button onClick={check} style={{ ...S.btnPrimary, marginTop: 16 }}>ACCEDI</button>
     </div>
