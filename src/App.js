@@ -880,7 +880,7 @@ export default function App() {
 
       <div style={{ background: C.surface, borderBottom: "1.5px solid " + C.border, padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 50, boxShadow: "0 1px 8px rgba(0,0,0,0.06)" }}>
         <div>
-          <div style={{ fontSize: 9, color: C.accent, letterSpacing: 3, fontFamily: "monospace", fontWeight: 700 }}>AGOSTINELLI</div>
+          <div style={{ fontSize: 9, color: C.accent, letterSpacing: 3, fontFamily: "monospace", fontWeight: 700 }}>AGRITURISMO AGOSTINELLI</div>
           <div style={{ fontSize: 22, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>Timbrature</div>
         </div>
         <Clock />
