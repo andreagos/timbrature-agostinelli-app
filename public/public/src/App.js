@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
-import { getDatabase, ref, push, onValue, remove } from "firebase/database";
+import { getDatabase, ref, push, onValue, remove, set, update, query, orderByChild, equalTo, get } from "firebase/database";
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendEmailVerification, sendPasswordResetEmail, signOut } from "firebase/auth";
 
-// ── FIREBASE CONFIG ──────────────────────────────────────
 const firebaseConfig = {
   apiKey: "AIzaSyDxhLmpCqJZ8zWsYISv-n4roSOt40Bl81E",
   authDomain: "timbrature-agriturismo.firebaseapp.com",
@@ -15,53 +15,76 @@ const firebaseConfig = {
 
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getDatabase(firebaseApp);
+const auth = getAuth(firebaseApp);
 
-// ── CONFIG ───────────────────────────────────────────────
-const MANAGER_PIN = "1234";
-const WORK_LAT = 45.8089;
-const WORK_LNG = 9.0583;
+// Manager: devono avere lo stesso elenco anche nelle regole del database (database.rules.json)
+const MANAGER_EMAILS = ["andreagos@hotmail.it", "agostinelli.pietro1405@gmail.com"];
+const isManagerUser = (u) => !!u && u.emailVerified && MANAGER_EMAILS.includes((u.email || "").toLowerCase());
+const WORK_LAT = 45.809417;
+const WORK_LNG = 9.023444;
 const GEOFENCE_RADIUS_M = 200;
 
-const EMPLOYEES = [
-  { id: "1", name: "Marco Rossi" },
-  { id: "2", name: "Laura Bianchi" },
-  { id: "3", name: "Giuseppe Verdi" },
-  { id: "4", name: "Anna Colombo" },
-];
-
 const C = {
-  bg: "#F5F4F0",
-  surface: "#FFFFFF",
-  surfaceAlt: "#F0EEE9",
-  border: "#E2DDD6",
-  borderStrong: "#C8C2B8",
-  text: "#1C1A17",
-  textSub: "#5C5750",
-  textMuted: "#9C9690",
-  accent: "#2D6A4F",
-  accentLight: "#E8F5EE",
-  danger: "#C0392B",
-  dangerLight: "#FDEDEC",
-  warn: "#B7791F",
-  warnLight: "#FFFBEB",
+  bg: "#F5F4F0", surface: "#FFFFFF", surfaceAlt: "#F0EEE9",
+  border: "#E2DDD6", borderStrong: "#C8C2B8",
+  text: "#1C1A17", textSub: "#5C5750", textMuted: "#9C9690",
+  accent: "#2D6A4F", accentLight: "#E8F5EE",
+  danger: "#C0392B", dangerLight: "#FDEDEC",
+  warn: "#B7791F", warnLight: "#FFFBEB",
 };
 
 const pad = (n) => String(n).padStart(2, "0");
 
+// Trova una timbratura dello stesso dipendente che si sovrappone all'intervallo [inMs, outMs)
+function findOverlap(list, inMs, outMs, excludeKey) {
+  return list.find(e => {
+    if (excludeKey && e.firebaseKey === excludeKey) return false;
+    const eIn = new Date(e.dateIn).getTime();
+    const eOut = new Date(e.dateOut).getTime();
+    return inMs < eOut && outMs > eIn;
+  });
+}
+
+// Elenco delle coppie di timbrature sovrapposte già presenti, per dipendente
+function listOverlaps(entries) {
+  const byEmp = {};
+  entries.forEach(e => { (byEmp[e.employeeId] = byEmp[e.employeeId] || []).push(e); });
+  const pairs = [];
+  Object.values(byEmp).forEach(list => {
+    const sorted = [...list].sort((a, b) => new Date(a.dateIn) - new Date(b.dateIn));
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        if (new Date(sorted[j].dateIn) >= new Date(sorted[i].dateOut)) break;
+        pairs.push([sorted[i], sorted[j]]);
+      }
+    }
+  });
+  return pairs.sort((a, b) => new Date(b[0].dateIn) - new Date(a[0].dateIn));
+}
+
+const authError = (err) => {
+  const c = (err && err.code) || "";
+  if (c.includes("invalid-credential") || c.includes("wrong-password") || c.includes("user-not-found")) return "Email o password errata";
+  if (c.includes("email-already-in-use")) return "Esiste già un account con questa email: usa Accedi";
+  if (c.includes("weak-password")) return "La password deve avere almeno 6 caratteri";
+  if (c.includes("invalid-email")) return "Email non valida";
+  if (c.includes("too-many-requests")) return "Troppi tentativi, riprova tra qualche minuto";
+  if (c.includes("network")) return "Connessione assente, riprova";
+  return "Errore — riprova";
+};
+
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const p1 = (lat1 * Math.PI) / 180, p2 = (lat2 * Math.PI) / 180;
-  const dp = ((lat2 - lat1) * Math.PI) / 180;
-  const dl = ((lon2 - lon1) * Math.PI) / 180;
+  const dp = ((lat2 - lat1) * Math.PI) / 180, dl = ((lon2 - lon1) * Math.PI) / 180;
   const a = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return "--";
-  const h = Math.floor(ms / 3600000);
-  const m = Math.floor((ms % 3600000) / 60000);
-  return `${pad(h)}h ${pad(m)}m`;
+  const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000);
+  return pad(h) + "h " + pad(m) + "m";
 }
 function formatDate(iso) {
   if (!iso) return "--";
@@ -72,15 +95,53 @@ function formatTime(iso) {
   return new Date(iso).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
 }
 
+// ── EXPORT CSV (Excel) ────────────────────────────────────
+function exportCSV(entries, employees, filename) {
+  const rows = [["Nome", "Data", "Entrata", "Uscita", "Ore lavorate", "Tipo", "Categoria", "Nota"]];
+  entries.sort((a, b) => new Date(a.dateIn) - new Date(b.dateIn)).forEach(e => {
+    const ms = new Date(e.dateOut) - new Date(e.dateIn);
+    const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000);
+    rows.push([
+      e.employeeName || "",
+      formatDate(e.dateIn),
+      formatTime(e.dateIn),
+      formatTime(e.dateOut),
+      pad(h) + ":" + pad(m),
+      e.type === "manual" ? "Manuale" : "Timer GPS",
+      e.categoria || "",
+      e.nota || ""
+    ]);
+  });
+  const csv = rows.map(r => r.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(",")).join("\n");
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename + ".csv"; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ── EXPORT HTML/PDF ───────────────────────────────────────
+function exportPDF(entries, title) {
+  const sorted = [...entries].sort((a, b) => new Date(a.dateIn) - new Date(b.dateIn));
+  const totalMs = sorted.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
+  const rows = sorted.map(e => {
+    const ms = new Date(e.dateOut) - new Date(e.dateIn);
+    const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000);
+    return "<tr><td>" + (e.employeeName || "") + "</td><td>" + formatDate(e.dateIn) + "</td><td>" + formatTime(e.dateIn) + "</td><td>" + formatTime(e.dateOut) + "</td><td>" + pad(h) + "h " + pad(m) + "m</td><td>" + (e.type === "manual" ? "Manuale" : "GPS") + "</td><td>" + (e.categoria || "") + "</td><td>" + (e.nota || "") + "</td></tr>";
+  }).join("");
+  const html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>" + title + "</title><style>body{font-family:Arial,sans-serif;padding:24px;color:#1C1A17}h1{color:#2D6A4F;font-size:20px}h2{color:#5C5750;font-size:14px;font-weight:normal;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:20px;font-size:12px}th{background:#2D6A4F;color:#fff;padding:8px;text-align:left}td{padding:8px;border-bottom:1px solid #E2DDD6}tr:nth-child(even){background:#F5F4F0}.totale{margin-top:16px;font-weight:700;font-size:14px;color:#2D6A4F}@media print{button{display:none}}</style></head><body><h1>Agriturismo Agostinelli — Timbrature</h1><h2>" + title + " · " + sorted.length + " timbrature</h2><table><thead><tr><th>Dipendente</th><th>Data</th><th>Entrata</th><th>Uscita</th><th>Ore</th><th>Tipo</th><th>Categoria</th><th>Nota</th></tr></thead><tbody>" + rows + "</tbody></table><p class='totale'>Totale ore: " + formatDuration(totalMs) + "</p><button onclick='window.print()' style='margin-top:20px;padding:10px 20px;background:#2D6A4F;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px'>🖨️ Stampa / Salva PDF</button></body></html>";
+  const w = window.open("", "_blank");
+  w.document.write(html);
+  w.document.close();
+}
+
 function Clock() {
   const [t, setT] = useState(new Date());
   useEffect(() => { const i = setInterval(() => setT(new Date()), 1000); return () => clearInterval(i); }, []);
   return (
     <div style={{ fontFamily: "monospace", fontSize: 11, color: C.textMuted, textAlign: "right" }}>
       <div>{t.toLocaleDateString("it-IT", { weekday: "short", day: "2-digit", month: "short" })}</div>
-      <div style={{ color: C.accent, fontWeight: 700, fontSize: 15 }}>
-        {pad(t.getHours())}:{pad(t.getMinutes())}:{pad(t.getSeconds())}
-      </div>
+      <div style={{ color: C.accent, fontWeight: 700, fontSize: 15 }}>{pad(t.getHours())}:{pad(t.getMinutes())}:{pad(t.getSeconds())}</div>
     </div>
   );
 }
@@ -89,7 +150,6 @@ function useGps() {
   const [state, setState] = useState("idle");
   const [distance, setDistance] = useState(null);
   const [coords, setCoords] = useState(null);
-
   const check = () => {
     if (!navigator.geolocation) { setState("error"); return; }
     setState("checking");
@@ -105,28 +165,23 @@ function useGps() {
       { enableHighAccuracy: true, timeout: 10000 }
     );
   };
-
   return { state, distance, coords, check };
 }
 
 function GpsBanner({ state, distance, onCheck }) {
   const cfg = {
-    idle:     { bg: C.surfaceAlt, border: C.border,   color: C.textSub,  icon: "📍", text: "Verifica posizione GPS" },
-    checking: { bg: C.warnLight,  border: "#F6C966",  color: C.warn,     icon: "⏳", text: "Rilevamento GPS in corso…" },
-    ok:       { bg: C.accentLight,border: "#6FCF97",  color: C.accent,   icon: "✅", text: `In sede · ${distance}m dalla sede` },
-    far:      { bg: C.dangerLight,border: "#F1948A",  color: C.danger,   icon: "🚫", text: `Troppo lontano · ${distance}m dalla sede` },
-    denied:   { bg: C.dangerLight,border: "#F1948A",  color: C.danger,   icon: "🔒", text: "GPS non autorizzato" },
-    error:    { bg: C.warnLight,  border: "#F6C966",  color: C.warn,     icon: "⚠️", text: "Errore GPS — riprova" },
+    idle:     { bg: C.surfaceAlt, border: C.border,  color: C.textSub, icon: "📍", text: "Verifica posizione GPS" },
+    checking: { bg: C.warnLight,  border: "#F6C966", color: C.warn,    icon: "⏳", text: "Rilevamento GPS…" },
+    ok:       { bg: C.accentLight,border: "#6FCF97", color: C.accent,  icon: "✅", text: "In sede · " + distance + "m" },
+    far:      { bg: C.dangerLight,border: "#F1948A", color: C.danger,  icon: "🚫", text: "Troppo lontano · " + distance + "m" },
+    denied:   { bg: C.dangerLight,border: "#F1948A", color: C.danger,  icon: "🔒", text: "GPS non autorizzato" },
+    error:    { bg: C.warnLight,  border: "#F6C966", color: C.warn,    icon: "⚠️", text: "Errore GPS — riprova" },
   }[state];
-
   return (
     <button onClick={onCheck} disabled={state === "checking"} style={{
-      display: "flex", alignItems: "center", gap: 10,
-      width: "100%", padding: "11px 14px", borderRadius: 12,
-      background: cfg.bg, border: `1.5px solid ${cfg.border}`,
-      color: cfg.color, fontSize: 12, fontWeight: 600,
-      fontFamily: "monospace", cursor: state === "checking" ? "default" : "pointer",
-      textAlign: "left",
+      display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "11px 14px", borderRadius: 12,
+      background: cfg.bg, border: "1.5px solid " + cfg.border, color: cfg.color,
+      fontSize: 12, fontWeight: 600, fontFamily: "monospace", cursor: state === "checking" ? "default" : "pointer", textAlign: "left",
     }}>
       <span style={{ fontSize: 18 }}>{cfg.icon}</span>
       <span style={{ flex: 1 }}>{cfg.text}</span>
@@ -143,142 +198,539 @@ function Toast({ toast }) {
       background: toast.type === "err" ? C.danger : C.accent,
       color: "#fff", padding: "11px 24px", borderRadius: 50,
       fontSize: 13, fontFamily: "monospace", fontWeight: 600,
-      boxShadow: "0 6px 24px rgba(0,0,0,0.18)", zIndex: 999,
-      whiteSpace: "nowrap",
+      boxShadow: "0 6px 24px rgba(0,0,0,0.18)", zIndex: 999, whiteSpace: "nowrap",
     }}>{toast.msg}</div>
   );
 }
 
-function Pill({ bg, color, children }) {
+function ConfirmModal({ onConfirm, onCancel, title, message }) {
   return (
-    <span style={{ fontSize: 10, padding: "3px 9px", borderRadius: 20, background: bg, color, fontFamily: "monospace", fontWeight: 600 }}>
-      {children}
-    </span>
-  );
-}
-
-function EntryCard({ entry: e, onDelete }) {
-  const dur = new Date(e.dateOut) - new Date(e.dateIn);
-  return (
-    <div style={{
-      background: C.surface, borderRadius: 12, padding: "13px 15px",
-      border: `1.5px solid ${C.border}`, borderLeft: `4px solid ${e.gps ? C.accent : C.borderStrong}`,
-    }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          {e.employeeName && <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{e.employeeName}</span>}
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 24 }}>
+      <div style={{ background: C.surface, borderRadius: 20, padding: 28, maxWidth: 320, width: "100%", boxShadow: "0 20px 60px rgba(0,0,0,0.2)" }}>
+        <div style={{ fontSize: 36, textAlign: "center", marginBottom: 12 }}>🗑️</div>
+        <div style={{ fontSize: 17, fontWeight: 700, color: C.text, textAlign: "center", marginBottom: 8 }}>{title || "Conferma"}</div>
+        <div style={{ fontSize: 13, color: C.textSub, textAlign: "center", marginBottom: 24, lineHeight: 1.5 }}>{message || "Sei sicuro?"}</div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onCancel} style={{ flex: 1, padding: "12px", background: C.surfaceAlt, border: "1.5px solid " + C.border, borderRadius: 12, color: C.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Annulla</button>
+          <button onClick={onConfirm} style={{ flex: 1, padding: "12px", background: C.danger, border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Elimina</button>
         </div>
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          {e.gps && <Pill bg={C.accentLight} color={C.accent}>📍 GPS</Pill>}
-          <Pill bg={e.type === "manual" ? "#EEF2FF" : C.accentLight} color={e.type === "manual" ? "#4338CA" : C.accent}>
-            {e.type === "manual" ? "Manuale" : "Timer"}
-          </Pill>
-          {onDelete && (
-            <button onClick={() => onDelete(e.firebaseKey)} style={{
-              padding: "3px 8px", background: "transparent",
-              border: `1px solid ${C.border}`, borderRadius: 6,
-              color: C.textMuted, fontSize: 11, cursor: "pointer",
-            }}>✕</button>
-          )}
-        </div>
-      </div>
-      <div style={{ display: "flex", gap: 12, alignItems: "center", fontFamily: "monospace", fontSize: 12, flexWrap: "wrap" }}>
-        <span style={{ color: C.textSub }}>{formatDate(e.dateIn)}</span>
-        <span style={{ color: C.accent }}>▶ {formatTime(e.dateIn)}</span>
-        <span style={{ color: C.textMuted }}>→</span>
-        <span style={{ color: C.danger }}>⏹ {formatTime(e.dateOut)}</span>
-        <span style={{ marginLeft: "auto", fontWeight: 700, color: C.text, fontSize: 14 }}>{formatDuration(dur)}</span>
       </div>
     </div>
   );
 }
 
-function EmployeeView({ entries }) {
-  const [employee, setEmployee] = useState("");
-  const [loggedIn, setLoggedIn] = useState(false);
+function Pill({ bg, color, children }) {
+  return <span style={{ fontSize: 10, padding: "3px 9px", borderRadius: 20, background: bg, color, fontFamily: "monospace", fontWeight: 600 }}>{children}</span>;
+}
+
+function EntryCard({ entry: e, onDelete, showEdit: canEdit, siblings }) {
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [editError, setEditError] = useState("");
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [editDate, setEditDate] = useState("");
+  const [editIn, setEditIn] = useState("");
+  const [editOut, setEditOut] = useState("");
+  const [editNota, setEditNota] = useState("");
+  const [editCategoria, setEditCategoria] = useState("");
+  const [editSaving, setEditSaving] = useState(false);
+  const dur = new Date(e.dateOut) - new Date(e.dateIn);
+  const CATEGORIE = ["Manutenzione del verde agriturismo","Cucina","Servizio evento","Preparazione carne","Pulizie generali","Giardino Giovanni","Giardino Fabio","Giardino Villa","Giardino Lorenzo","Giardino Tommaso","Giardino Andrea","Giardino Adriano (Como)","Condominio via Diaz San Fermo","Consegne","Altro"];
+
+  const openEdit = () => {
+    const dIn = new Date(e.dateIn);
+    const dOut = new Date(e.dateOut);
+    setEditDate(dIn.toISOString().slice(0, 10));
+    setEditIn(pad(dIn.getHours()) + ":" + pad(dIn.getMinutes()));
+    setEditOut(pad(dOut.getHours()) + ":" + pad(dOut.getMinutes()));
+    setEditNota(e.nota || "");
+    setEditCategoria(e.categoria || "");
+    setEditError("");
+    setShowEditModal(true);
+  };
+
+  const handleEdit = async () => {
+    if (!editDate || !editIn || !editOut) return;
+    const dateIn = new Date(editDate + "T" + editIn).toISOString();
+    const dateOut = new Date(editDate + "T" + editOut).toISOString();
+    if (new Date(dateOut) <= new Date(dateIn)) { setEditError("L'uscita deve essere dopo l'entrata"); return; }
+    const clash = findOverlap(siblings || [], new Date(dateIn).getTime(), new Date(dateOut).getTime(), e.firebaseKey);
+    if (clash) { setEditError("Si sovrappone a " + formatTime(clash.dateIn) + " → " + formatTime(clash.dateOut) + " del " + formatDate(clash.dateIn)); return; }
+    setEditSaving(true);
+    setEditError("");
+    try {
+      await update(ref(db, "timbrature/" + e.firebaseKey), { dateIn, dateOut, nota: editNota || null, categoria: editCategoria || null });
+      setShowEditModal(false);
+    } catch (err) { setEditError("Errore salvataggio — riprova"); }
+    setEditSaving(false);
+  };
+
+  return (
+    <>
+      {showConfirm && <ConfirmModal onConfirm={() => { onDelete(e.firebaseKey); setShowConfirm(false); }} onCancel={() => setShowConfirm(false)} title="Elimina timbratura" message="Sei sicuro di voler eliminare questa timbratura?" />}
+      {showEditModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 }}>
+          <div style={{ background: C.surface, borderRadius: 20, padding: 24, width: "100%", maxWidth: 380, boxShadow: "0 20px 60px rgba(0,0,0,0.2)", maxHeight: "90vh", overflowY: "auto" }}>
+            <div style={{ fontSize: 17, fontWeight: 700, color: C.text, marginBottom: 16, fontFamily: "Georgia, serif" }}>Modifica timbratura</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div><label style={S.label}>Data</label><input type="date" value={editDate} onChange={ev => setEditDate(ev.target.value)} style={S.input} /></div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div><label style={S.label}>Entrata</label><input type="time" value={editIn} onChange={ev => setEditIn(ev.target.value)} style={S.input} /></div>
+                <div><label style={S.label}>Uscita</label><input type="time" value={editOut} onChange={ev => setEditOut(ev.target.value)} style={S.input} /></div>
+              </div>
+              <div><label style={S.label}>Categoria</label><select value={editCategoria} onChange={ev => setEditCategoria(ev.target.value)} style={S.select}><option value="">— Seleziona —</option>{CATEGORIE.map(c => <option key={c} value={c}>{c === "Altro" ? "Altro (Specificare)" : c}</option>)}</select></div>
+              <div><label style={S.label}>Nota</label><input value={editNota} onChange={ev => setEditNota(ev.target.value)} placeholder="es. trasferta, straordinario..." style={S.input} /></div>
+              {editError && <div style={{ color: C.danger, fontSize: 12, fontFamily: "monospace" }}>⚠️ {editError}</div>}
+              <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+                <button onClick={() => setShowEditModal(false)} style={{ flex: 1, padding: "12px", background: C.surfaceAlt, border: "1.5px solid " + C.border, borderRadius: 12, color: C.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Annulla</button>
+                <button onClick={handleEdit} disabled={editSaving} style={{ flex: 1, padding: "12px", background: C.accent, border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: editSaving ? 0.6 : 1 }}>{editSaving ? "..." : "Salva"}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      <div style={{ background: C.surface, borderRadius: 12, padding: "13px 15px", border: "1.5px solid " + C.border, borderLeft: "4px solid " + (e.gps ? C.accent : C.borderStrong) }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            {e.employeeName && <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{e.employeeName}</span>}
+          </div>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            {e.gps && <Pill bg={C.accentLight} color={C.accent}>GPS</Pill>}
+            <Pill bg={e.type === "manual" ? "#EEF2FF" : C.accentLight} color={e.type === "manual" ? "#4338CA" : C.accent}>{e.type === "manual" ? "Manuale" : "Timer"}</Pill>
+            {canEdit !== false && <button onClick={openEdit} style={{ padding: "3px 8px", background: "transparent", border: "1px solid " + C.border, borderRadius: 6, color: C.textMuted, fontSize: 11, cursor: "pointer" }}>✏️</button>}
+            {onDelete && <button onClick={() => setShowConfirm(true)} style={{ padding: "3px 8px", background: "transparent", border: "1px solid " + C.border, borderRadius: 6, color: C.textMuted, fontSize: 11, cursor: "pointer" }}>✕</button>}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", fontFamily: "monospace", fontSize: 12, flexWrap: "wrap" }}>
+          <span style={{ color: C.textSub }}>{formatDate(e.dateIn)}</span>
+          <span style={{ color: C.accent }}>▶ {formatTime(e.dateIn)}</span>
+          <span style={{ color: C.textMuted }}>-></span>
+          <span style={{ color: C.danger }}>⏹ {formatTime(e.dateOut)}</span>
+          <span style={{ marginLeft: "auto", fontWeight: 700, color: C.text, fontSize: 14 }}>{formatDuration(dur)}</span>
+        </div>
+        {e.nota && <div style={{ marginTop: 6, fontSize: 11, color: C.textSub, fontFamily: "monospace", background: C.surfaceAlt, padding: "4px 8px", borderRadius: 6 }}>📝 {e.nota}</div>}
+        {e.categoria && <div style={{ marginTop: 4, fontSize: 11, color: C.accent, fontFamily: "monospace", background: C.accentLight, padding: "4px 8px", borderRadius: 6, display: "inline-block" }}>🏷️ {e.categoria}</div>}
+      </div>
+    </>
+  );
+}
+
+// ── ACCESSO (login / primo accesso / password dimenticata) ─
+function AuthScreen({ title, eyebrow }) {
+  const [mode, setMode] = useState("login"); // login | register | forgot
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [password2, setPassword2] = useState("");
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const go = (m) => { setMode(m); setError(""); setInfo(""); setPassword(""); setPassword2(""); };
+
+  const submit = async () => {
+    setError(""); setInfo("");
+    const mail = email.trim().toLowerCase();
+    if (!mail || !mail.includes("@")) { setError("Inserisci un'email valida"); return; }
+    if (mode === "forgot") {
+      setLoading(true);
+      try { await sendPasswordResetEmail(auth, mail); setInfo("Se l'email è registrata, riceverai un link per impostare una nuova password."); }
+      catch (e) { setError(authError(e)); }
+      setLoading(false);
+      return;
+    }
+    if (!password) { setError("Inserisci la password"); return; }
+    if (mode === "register") {
+      if (password.length < 8) { setError("La password deve avere almeno 8 caratteri"); return; }
+      if (password !== password2) { setError("Le password non coincidono"); return; }
+    }
+    setLoading(true);
+    try {
+      if (mode === "register") {
+        const cred = await createUserWithEmailAndPassword(auth, mail, password);
+        await sendEmailVerification(cred.user);
+      } else {
+        await signInWithEmailAndPassword(auth, mail, password);
+      }
+    } catch (e) { setError(authError(e)); }
+    setLoading(false);
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.eyebrow}>{mode === "register" ? "PRIMO ACCESSO" : mode === "forgot" ? "RECUPERO PASSWORD" : eyebrow}</div>
+      <div style={{ fontSize: 20, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif", marginBottom: 8 }}>
+        {mode === "register" ? "Crea il tuo accesso" : mode === "forgot" ? "Password dimenticata" : title}
+      </div>
+      {mode === "register" && <p style={{ fontSize: 12, color: C.textSub, lineHeight: 1.5, marginBottom: 14 }}>Se avevi già un account, usa la <strong>stessa email</strong>: ritroverai tutte le tue timbrature. Scegli una password nuova, diversa da quelle che usi altrove.</p>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: mode === "register" ? 0 : 12 }}>
+        <div><label style={S.label}>Email</label><input type="email" autoComplete="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="la-tua@email.it" style={S.input} /></div>
+        {mode !== "forgot" && <div><label style={S.label}>Password</label><input type="password" autoComplete={mode === "register" ? "new-password" : "current-password"} value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === "Enter" && mode === "login" && submit()} placeholder={mode === "register" ? "Minimo 8 caratteri" : "••••••"} style={S.input} /></div>}
+        {mode === "register" && <div><label style={S.label}>Conferma password</label><input type="password" autoComplete="new-password" value={password2} onChange={e => setPassword2(e.target.value)} placeholder="Ripeti la password" style={S.input} /></div>}
+        {error && <div style={{ color: C.danger, fontSize: 12, fontFamily: "monospace" }}>⚠️ {error}</div>}
+        {info && <div style={{ color: C.accent, fontSize: 12, lineHeight: 1.5 }}>✓ {info}</div>}
+        <button onClick={submit} disabled={loading} style={{ ...S.btnPrimary, opacity: loading ? 0.6 : 1 }}>
+          {loading ? "ATTENDI…" : mode === "register" ? "CREA ACCESSO" : mode === "forgot" ? "INVIA LINK" : "ACCEDI"}
+        </button>
+        {mode === "login" && <>
+          <button onClick={() => go("forgot")} style={{ background: "none", border: "none", color: C.textSub, fontSize: 12, cursor: "pointer", textDecoration: "underline" }}>Password dimenticata?</button>
+          <div style={{ textAlign: "center", fontSize: 12, color: C.textSub }}>Primo accesso con la nuova app?</div>
+          <button onClick={() => go("register")} style={S.btnGhost}>Crea il tuo accesso →</button>
+        </>}
+        {mode !== "login" && <button onClick={() => go("login")} style={S.btnGhost}>← Torna al login</button>}
+      </div>
+    </div>
+  );
+}
+
+// ── VERIFICA EMAIL ─────────────────────────────────────────
+function VerifyEmailScreen({ user }) {
+  const [msg, setMsg] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const check = async () => {
+    setLoading(true); setMsg("");
+    try {
+      await user.reload();
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await auth.currentUser.getIdToken(true);
+        window.location.reload();
+        return;
+      }
+      setMsg("Email non ancora confermata. Apri il link che ti abbiamo mandato (controlla anche lo spam).");
+    } catch (e) { setMsg(authError(e)); }
+    setLoading(false);
+  };
+
+  const resend = async () => {
+    setMsg("");
+    try { await sendEmailVerification(user); setMsg("Email inviata di nuovo."); }
+    catch (e) { setMsg(authError(e)); }
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.eyebrow}>CONFERMA EMAIL</div>
+      <div style={{ fontSize: 18, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif", marginBottom: 10 }}>Controlla la tua email</div>
+      <p style={{ fontSize: 13, color: C.textSub, lineHeight: 1.6, marginBottom: 16 }}>Abbiamo inviato un link a <strong>{user.email}</strong>. Aprilo per confermare che l'indirizzo è tuo, poi torna qui e premi il pulsante.</p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <button onClick={check} disabled={loading} style={{ ...S.btnPrimary, opacity: loading ? 0.6 : 1 }}>{loading ? "CONTROLLO…" : "HO CONFERMATO"}</button>
+        <button onClick={resend} style={S.btnGhost}>Invia di nuovo l'email</button>
+        <button onClick={() => signOut(auth)} style={S.btnGhost}>Esci</button>
+        {msg && <div style={{ fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{msg}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ── PROFILO NUOVO DIPENDENTE ───────────────────────────────
+function ProfileScreen({ user, onDone }) {
+  const [nome, setNome] = useState("");
+  const [cognome, setCognome] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const save = async () => {
+    setError("");
+    if (!nome.trim() || !cognome.trim()) { setError("Compila nome e cognome"); return; }
+    setLoading(true);
+    try {
+      const newRef = push(ref(db, "employees"));
+      const data = { nome: nome.trim(), cognome: cognome.trim(), email: user.email.toLowerCase(), uid: user.uid, createdAt: new Date().toISOString() };
+      await set(newRef, data);
+      onDone({ ...data, id: newRef.key });
+    } catch (e) { setError("Errore — riprova"); }
+    setLoading(false);
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.eyebrow}>NUOVO DIPENDENTE</div>
+      <div style={{ fontSize: 20, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif", marginBottom: 20 }}>Come ti chiami?</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <div><label style={S.label}>Nome</label><input value={nome} onChange={e => setNome(e.target.value)} placeholder="Marco" style={S.input} /></div>
+          <div><label style={S.label}>Cognome</label><input value={cognome} onChange={e => setCognome(e.target.value)} placeholder="Rossi" style={S.input} /></div>
+        </div>
+        {error && <div style={{ color: C.danger, fontSize: 12, fontFamily: "monospace" }}>⚠️ {error}</div>}
+        <button onClick={save} disabled={loading} style={{ ...S.btnPrimary, opacity: loading ? 0.6 : 1 }}>{loading ? "SALVATAGGIO…" : "CONTINUA"}</button>
+        <button onClick={() => signOut(auth)} style={S.btnGhost}>Esci</button>
+      </div>
+    </div>
+  );
+}
+
+// ── EMPLOYEE VIEW ──────────────────────────────────────────
+// Collega l'utente loggato alla sua scheda dipendente:
+// 1) scheda con il suo uid  2) scheda vecchia con la sua email (la "reclama")  3) altrimenti ne crea una nuova
+function EmployeeView({ user }) {
+  const [emp, setEmp] = useState(null);
+  const [status, setStatus] = useState("loading"); // loading | profile | ready | error
+  const [entries, setEntries] = useState([]);
+  const [info, setInfo] = useState("");
+
+  useEffect(() => {
+    if (!user || !user.emailVerified) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const empRef = ref(db, "employees");
+        const byUid = await get(query(empRef, orderByChild("uid"), equalTo(user.uid)));
+        if (cancelled) return;
+        if (byUid.exists()) {
+          const [id, v] = Object.entries(byUid.val())[0];
+          setEmp({ ...v, id }); setStatus("ready"); return;
+        }
+        const byEmail = await get(query(empRef, orderByChild("email"), equalTo(user.email.toLowerCase())));
+        if (cancelled) return;
+        const unclaimed = byEmail.exists() ? Object.entries(byEmail.val()).find(([, v]) => !v.uid) : null;
+        if (unclaimed) {
+          const [id, v] = unclaimed;
+          await update(ref(db, "employees/" + id), { uid: user.uid, passwordHash: null });
+          if (cancelled) return;
+          setEmp({ ...v, id, uid: user.uid }); setStatus("ready"); return;
+        }
+        setStatus("profile");
+      } catch (e) {
+        if (!cancelled) { setStatus("error"); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
+
+  useEffect(() => {
+    if (!emp) return;
+    const q = query(ref(db, "timbrature"), orderByChild("employeeId"), equalTo(emp.id));
+    const unsub = onValue(q, snap => {
+      const d = snap.val();
+      setEntries(d ? Object.entries(d).map(([k, v]) => ({ ...v, firebaseKey: k })) : []);
+    });
+    return () => unsub();
+  }, [emp]);
+
+  const resetPwd = async () => {
+    try { await sendPasswordResetEmail(auth, user.email); setInfo("Ti abbiamo mandato un'email per cambiare la password."); }
+    catch (e) { setInfo(authError(e)); }
+    setTimeout(() => setInfo(""), 5000);
+  };
+
+  if (!user) return <AuthScreen eyebrow="ACCESSO DIPENDENTE" title="Accedi" />;
+  if (!user.emailVerified) return <VerifyEmailScreen user={user} />;
+  if (status === "loading") return <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontFamily: "monospace", fontSize: 13 }}>Caricamento…</div>;
+  if (status === "error") return (
+    <div style={S.card}>
+      <div style={{ fontSize: 14, color: C.danger, marginBottom: 12 }}>Non riesco a caricare il tuo profilo. Riprova o contatta il responsabile.</div>
+      <button onClick={() => signOut(auth)} style={S.btnGhost}>Esci</button>
+    </div>
+  );
+  if (status === "profile") return <ProfileScreen user={user} onDone={(e) => { setEmp(e); setStatus("ready"); }} />;
+
+  return <>
+    {info && <div style={{ ...S.card, marginBottom: 12, fontSize: 12, color: C.accent }}>{info}</div>}
+    <EmployeeApp emp={emp} entries={entries} onLogout={() => signOut(auth)} onResetPwd={resetPwd} />
+  </>;
+}
+
+// ── EMPLOYEE APP ───────────────────────────────────────────
+function EmployeeApp({ emp, entries, onLogout, onResetPwd }) {
   const [activeTimer, setActiveTimer] = useState(null);
   const [elapsed, setElapsed] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const [pausedAt, setPausedAt] = useState(null);
+  const [totalPaused, setTotalPaused] = useState(0);
   const [mDate, setMDate] = useState("");
   const [mIn, setMIn] = useState("");
   const [mOut, setMOut] = useState("");
+  const [mNota, setMNota] = useState("");
+  const [mCategoria, setMCategoria] = useState("");
+  const [nota, setNota] = useState("");
+  const [categoria, setCategoria] = useState("");
   const [tab, setTab] = useState("timer");
   const [toast, setToast] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [duplicateWarning, setDuplicateWarning] = useState(false);
+  const [overlapWarning, setOverlapWarning] = useState(null);
   const interval = useRef(null);
   const geo = useGps();
 
-  const toast_ = (msg, type = "ok") => { setToast({ msg, type }); setTimeout(() => setToast(null), 2800); };
+  const toast_ = (msg, type) => { setToast({ msg, type: type || "ok" }); setTimeout(() => setToast(null), 2800); };
 
   useEffect(() => {
-    if (activeTimer) { interval.current = setInterval(() => setElapsed(Date.now() - activeTimer), 1000); }
-    else { clearInterval(interval.current); setElapsed(0); }
+    if (activeTimer && !paused) {
+      interval.current = setInterval(() => setElapsed(Date.now() - activeTimer - totalPaused), 1000);
+    } else {
+      clearInterval(interval.current);
+    }
     return () => clearInterval(interval.current);
-  }, [activeTimer]);
+  }, [activeTimer, paused, totalPaused]);
 
   const saveToFirebase = async (entry) => {
     setSaving(true);
-    try {
-      await push(ref(db, "timbrature"), entry);
-    } catch (e) {
-      toast_("Errore salvataggio — riprova", "err");
-    }
+    try { await push(ref(db, "timbrature"), entry); }
+    catch (e) { toast_("Errore salvataggio — riprova", "err"); }
     setSaving(false);
   };
 
-  if (!loggedIn) return (
-    <div style={S.card}>
-      <Toast toast={toast} />
-      <div style={S.eyebrow}>ACCESSO DIPENDENTE</div>
-      <p style={{ color: C.textSub, fontSize: 13, marginBottom: 16 }}>Seleziona il tuo nome per accedere</p>
-      <select value={employee} onChange={(e) => setEmployee(e.target.value)} style={S.select}>
-        <option value="">— Seleziona —</option>
-        {EMPLOYEES.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
-      </select>
-      <button onClick={() => employee && setLoggedIn(true)} disabled={!employee} style={{ ...S.btnPrimary, opacity: employee ? 1 : 0.4 }}>
-        ENTRA
-      </button>
-    </div>
-  );
+  const empName = emp.nome + " " + emp.cognome;
 
-  const empName = EMPLOYEES.find((e) => e.id === employee)?.name;
-  const myEntries = entries.filter((e) => e.employeeId === employee).sort((a, b) => new Date(b.dateIn) - new Date(a.dateIn)).slice(0, 6);
+  // Riepilogo mese corrente
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const myEntries = entries.filter(e => e.employeeId === emp.id);
+  const monthEntries = myEntries.filter(e => new Date(e.dateIn) >= startOfMonth);
+  const monthMs = monthEntries.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
+  const [historyMonth, setHistoryMonth] = useState(() => {
+    const n = new Date();
+    return n.getFullYear() + "-" + String(n.getMonth() + 1).padStart(2, "0");
+  });
+  const recentEntries = [...myEntries]
+    .filter(e => {
+      const d = new Date(e.dateIn);
+      const m = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+      return m === historyMonth;
+    })
+    .sort((a, b) => new Date(b.dateIn) - new Date(a.dateIn));
 
   const startTimer = () => {
     if (geo.state !== "ok") { toast_("Devi essere in sede per timbrare", "err"); return; }
-    setActiveTimer(Date.now());
+    const nowMs = Date.now();
+    const clash = findOverlap(myEntries, nowMs, nowMs + 1);
+    if (clash) { toast_("Hai già una timbratura fino alle " + formatTime(clash.dateOut) + ": correggila prima di avviare il timer", "err"); return; }
+    setActiveTimer(nowMs);
+    setPaused(false);
+    setPausedAt(null);
+    setTotalPaused(0);
+    setNota("");
+    setCategoria("");
     toast_("Buona giornata! Timer avviato ✓");
   };
 
+  const togglePause = () => {
+    if (!paused) {
+      setPaused(true);
+      setPausedAt(Date.now());
+      toast_("⏸ Pausa avviata");
+    } else {
+      const pauseDur = Date.now() - pausedAt;
+      setTotalPaused(prev => prev + pauseDur);
+      setPaused(false);
+      setPausedAt(null);
+      toast_("▶ Ripreso!");
+    }
+  };
+
   const stopTimer = async () => {
-    const dateIn = new Date(Date.now() - elapsed).toISOString();
+    const pauseDur = paused ? Date.now() - pausedAt : 0;
+    const totPaused = totalPaused + pauseDur;
+    const startTime = new Date(activeTimer);
+    const dateIn = startTime.toISOString();
     const dateOut = new Date().toISOString();
-    const entry = { employeeId: employee, employeeName: empName, dateIn, dateOut, type: "timer", gps: geo.coords };
+    const clash = findOverlap(myEntries, startTime.getTime(), new Date(dateOut).getTime());
+    if (clash) {
+      setOverlapWarning({ conflictIn: formatTime(clash.dateIn), conflictOut: formatTime(clash.dateOut), conflictCategoria: clash.categoria || clash.type });
+      return; // il timer resta attivo: correggi la timbratura in conflitto e poi ferma di nuovo
+    }
     setActiveTimer(null);
-    await saveToFirebase(entry);
+    setPaused(false);
+    setPausedAt(null);
+    setTotalPaused(0);
+    setElapsed(0);
+    await saveToFirebase({ employeeId: emp.id, employeeName: empName, dateIn, dateOut, type: "timer", gps: geo.coords, nota: nota || null, categoria: categoria || null, pauseMs: totPaused });
     toast_("Timbratura salvata ✓");
   };
 
   const saveManual = async () => {
     if (!mDate || !mIn || !mOut) { toast_("Compila tutti i campi", "err"); return; }
-    const dateIn = new Date(`${mDate}T${mIn}`).toISOString();
-    const dateOut = new Date(`${mDate}T${mOut}`).toISOString();
+    const dateIn = new Date(mDate + "T" + mIn).toISOString();
+    const dateOut = new Date(mDate + "T" + mOut).toISOString();
     if (new Date(dateOut) <= new Date(dateIn)) { toast_("L'uscita deve essere dopo l'entrata", "err"); return; }
-    const entry = { employeeId: employee, employeeName: empName, dateIn, dateOut, type: "manual" };
-    await saveToFirebase(entry);
-    setMDate(""); setMIn(""); setMOut("");
+
+    // Controllo sovrapposizione orari
+    const newIn = new Date(dateIn).getTime();
+    const newOut = new Date(dateOut).getTime();
+    const overlap = findOverlap(myEntries, newIn, newOut);
+    if (overlap) {
+      setOverlapWarning({
+        conflictIn: formatTime(overlap.dateIn),
+        conflictOut: formatTime(overlap.dateOut),
+        conflictCategoria: overlap.categoria || overlap.type,
+      });
+      return;
+    }
+
+    await doSaveManual();
+  };
+
+  const doSaveManual = async () => {
+    const dateIn = new Date(mDate + "T" + mIn).toISOString();
+    const dateOut = new Date(mDate + "T" + mOut).toISOString();
+    await saveToFirebase({ employeeId: emp.id, employeeName: empName, dateIn, dateOut, type: "manual", nota: mNota || null, categoria: mCategoria || null });
+    setMDate(""); setMIn(""); setMOut(""); setMNota(""); setMCategoria("");
+    setDuplicateWarning(false);
     toast_("Timbratura manuale salvata ✓");
   };
 
   return (
     <>
       <Toast toast={toast} />
-      <div style={S.card}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
-          <div>
-            <div style={S.eyebrow}>DIPENDENTE</div>
-            <div style={{ fontSize: 21, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>{empName}</div>
+      {overlapWarning && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 24 }}>
+          <div style={{ background: C.surface, borderRadius: 20, padding: 28, maxWidth: 320, width: "100%", boxShadow: "0 20px 60px rgba(0,0,0,0.2)" }}>
+            <div style={{ fontSize: 36, textAlign: "center", marginBottom: 12 }}>🚫</div>
+            <div style={{ fontSize: 17, fontWeight: 700, color: C.danger, textAlign: "center", marginBottom: 8 }}>Sovrapposizione orari!</div>
+            <div style={{ fontSize: 13, color: C.textSub, textAlign: "center", marginBottom: 12, lineHeight: 1.6 }}>
+              Gli orari inseriti si sovrappongono con una timbratura esistente:
+            </div>
+            <div style={{ background: C.dangerLight, borderRadius: 10, padding: "10px 14px", textAlign: "center", marginBottom: 20 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.danger }}>{overlapWarning.conflictIn} → {overlapWarning.conflictOut}</div>
+              <div style={{ fontSize: 11, color: C.textSub, marginTop: 4 }}>{overlapWarning.conflictCategoria}</div>
+            </div>
+            <div style={{ fontSize: 12, color: C.textSub, textAlign: "center", marginBottom: 20 }}>
+              Correggi gli orari per evitare sovrapposizioni.
+            </div>
+            <button onClick={() => setOverlapWarning(null)} style={{ width: "100%", padding: "12px", background: C.accent, border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+              Correggi gli orari
+            </button>
           </div>
-          <button onClick={() => { setLoggedIn(false); setActiveTimer(null); }} style={S.btnGhost}>Esci</button>
+        </div>
+      )}
+      {duplicateWarning && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 24 }}>
+          <div style={{ background: C.surface, borderRadius: 20, padding: 28, maxWidth: 320, width: "100%", boxShadow: "0 20px 60px rgba(0,0,0,0.2)" }}>
+            <div style={{ fontSize: 36, textAlign: "center", marginBottom: 12 }}>⚠️</div>
+            <div style={{ fontSize: 17, fontWeight: 700, color: C.text, textAlign: "center", marginBottom: 8 }}>Timbratura già presente</div>
+            <div style={{ fontSize: 13, color: C.textSub, textAlign: "center", marginBottom: 24, lineHeight: 1.6 }}>
+              Esiste già una timbratura per il <strong>{mDate ? new Date(mDate).toLocaleDateString("it-IT", { day: "2-digit", month: "long" }) : ""}</strong>. Vuoi aggiungerla comunque?
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={() => setDuplicateWarning(false)} style={{ flex: 1, padding: "12px", background: C.surfaceAlt, border: "1.5px solid " + C.border, borderRadius: 12, color: C.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Annulla</button>
+              <button onClick={doSaveManual} style={{ flex: 1, padding: "12px", background: C.warn, border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Aggiungi comunque</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div style={S.card}>
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+          <div>
+            <div style={S.eyebrow}>BENVENUTO</div>
+            <div style={{ fontSize: 21, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>{empName}</div>
+            <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginTop: 2 }}>{emp.email}</div>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={onResetPwd} style={{ ...S.btnGhost, padding: "6px 10px", fontSize: 11 }}>🔑</button>
+            <button onClick={onLogout} style={S.btnGhost}>Esci</button>
+          </div>
+        </div>
+
+        {/* Riepilogo mese */}
+        <div style={{ background: C.accentLight, borderRadius: 12, padding: "12px 14px", marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 10, color: C.accent, fontFamily: "monospace", letterSpacing: 1 }}>ORE QUESTO MESE</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: C.accent, fontFamily: "Georgia, serif" }}>{formatDuration(monthMs)}</div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 10, color: C.textSub, fontFamily: "monospace" }}>TIMBRATURE</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>{monthEntries.length}</div>
+          </div>
         </div>
 
         <div style={S.tabs}>
@@ -287,76 +739,161 @@ function EmployeeView({ entries }) {
           ))}
         </div>
 
+        {/* TIMER TAB */}
         {tab === "timer" && (
           <div>
-            <div style={{ marginBottom: 16 }}>
-              <GpsBanner state={geo.state} distance={geo.distance} onCheck={geo.check} />
-            </div>
+            <div style={{ marginBottom: 16 }}><GpsBanner state={geo.state} distance={geo.distance} onCheck={geo.check} /></div>
             {!activeTimer && geo.state !== "ok" && (
-              <div style={{ display: "flex", gap: 12, background: C.warnLight, border: `1.5px solid #F6C96640`, borderRadius: 12, padding: "13px 16px", marginBottom: 16 }}>
+              <div style={{ display: "flex", gap: 12, background: C.warnLight, border: "1.5px solid #F6C96640", borderRadius: 12, padding: "13px 16px", marginBottom: 16 }}>
                 <span style={{ fontSize: 22 }}>📍</span>
                 <div>
                   <div style={{ fontWeight: 600, color: C.warn, fontSize: 13 }}>Posizione richiesta</div>
-                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 3, lineHeight: 1.5 }}>
-                    Il timer si avvia solo quando sei in sede (entro {GEOFENCE_RADIUS_M}m).
-                  </div>
+                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 3, lineHeight: 1.5 }}>Il timer si avvia solo quando sei in sede (entro {GEOFENCE_RADIUS_M}m).</div>
                 </div>
               </div>
             )}
-            <div style={{ textAlign: "center", padding: "12px 0 20px" }}>
+            <div style={{ textAlign: "center", padding: "12px 0 8px" }}>
               {activeTimer ? (
                 <>
                   <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginBottom: 6 }}>
-                    ENTRATA · {formatTime(new Date(Date.now() - elapsed).toISOString())}
+                    ENTRATA · {formatTime(new Date(activeTimer).toISOString())}
+                    {paused && <span style={{ color: C.warn, marginLeft: 8 }}>· IN PAUSA</span>}
                   </div>
-                  <div style={{ fontSize: 64, fontWeight: 900, color: C.accent, fontFamily: "Georgia, serif", lineHeight: 1, marginBottom: 6 }}>
+                  <div style={{ fontSize: 64, fontWeight: 900, color: paused ? C.warn : C.accent, fontFamily: "Georgia, serif", lineHeight: 1, marginBottom: 4 }}>
                     {formatDuration(elapsed)}
                   </div>
-                  <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginBottom: 24 }}>ORE LAVORATE</div>
-                  <button onClick={stopTimer} disabled={saving} style={{ ...S.btnDanger, opacity: saving ? 0.6 : 1 }}>
-                    {saving ? "SALVATAGGIO…" : "⏹ TIMBRA USCITA"}
-                  </button>
+                  {totalPaused > 0 && (
+                    <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginBottom: 4 }}>
+                      pausa totale: {formatDuration(totalPaused)}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginBottom: 16 }}>ORE LAVORATE</div>
+
+                  {/* Nota */}
+                  <div style={{ marginBottom: 16, textAlign: "left" }}>
+                    <label style={S.label}>Categoria</label>
+                    <select value={categoria} onChange={e => setCategoria(e.target.value)} style={S.select}>
+                      <option value="">— Seleziona categoria —</option>
+                      <option value="Manutenzione del verde agriturismo">Manutenzione del verde agriturismo</option>
+                      <option value="Cucina">Cucina</option>
+                      <option value="Servizio evento">Servizio evento</option>
+                      <option value="Preparazione carne">Preparazione carne</option>
+                      <option value="Pulizie generali">Pulizie generali</option>
+                      <option value="Giardino Giovanni">Giardino Giovanni</option>
+                      <option value="Giardino Fabio">Giardino Fabio</option>
+                      <option value="Giardino Villa">Giardino Villa</option>
+                      <option value="Giardino Lorenzo">Giardino Lorenzo</option>
+                      <option value="Giardino Tommaso">Giardino Tommaso</option>
+                      <option value="Giardino Andrea">Giardino Andrea</option>
+                      <option value="Giardino Adriano (Como)">Giardino Adriano (Como)</option>
+                      <option value="Condominio via Diaz San Fermo">Condominio via Diaz San Fermo</option>
+                      <option value="Consegne">Consegne</option>
+                      <option value="Altro">Altro (Specificare)</option>
+                    </select>
+                    {categoria === "Altro" && (
+                      <input value={nota} onChange={e => setNota(e.target.value)} placeholder="Specifica l'attività..." style={{ ...S.input, marginTop: 8 }} />
+                    )}
+                  </div>
+
+                  <div style={{ marginBottom: 16, textAlign: "left" }}>
+                    <label style={S.label}>Nota (opzionale)</label>
+                    <input value={nota} onChange={e => setNota(e.target.value)} placeholder="es. trasferta, straordinario..." style={S.input} />
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button onClick={togglePause} style={{
+                      flex: 1, padding: "13px", background: paused ? C.accent : C.warnLight,
+                      border: "1.5px solid " + (paused ? C.accent : C.warn), borderRadius: 12,
+                      color: paused ? "#fff" : C.warn, fontSize: 13, fontWeight: 700,
+                      fontFamily: "monospace", cursor: "pointer", letterSpacing: 1,
+                    }}>
+                      {paused ? "▶ RIPRENDI" : "⏸ PAUSA"}
+                    </button>
+                    <button onClick={stopTimer} disabled={saving || paused} style={{ ...S.btnDanger, flex: 1, opacity: (saving || paused) ? 0.5 : 1 }}>
+                      {saving ? "…" : "⏹ USCITA"}
+                    </button>
+                  </div>
+                  {paused && <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginTop: 8 }}>Riprendi il timer per poter timbrare l'uscita</div>}
                 </>
               ) : (
                 <>
-                  <div style={{ fontSize: 64, fontWeight: 900, color: C.borderStrong, fontFamily: "Georgia, serif", lineHeight: 1, marginBottom: 6 }}>
-                    --:--
-                  </div>
+                  <div style={{ fontSize: 64, fontWeight: 900, color: C.borderStrong, fontFamily: "Georgia, serif", lineHeight: 1, marginBottom: 6 }}>--:--</div>
                   <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginBottom: 24 }}>TIMER NON ATTIVO</div>
-                  <button onClick={startTimer} disabled={geo.state !== "ok"} style={{ ...S.btnPrimary, opacity: geo.state === "ok" ? 1 : 0.38 }}>
-                    ▶ TIMBRA ENTRATA
-                  </button>
+                  <button onClick={startTimer} disabled={geo.state !== "ok"} style={{ ...S.btnPrimary, opacity: geo.state === "ok" ? 1 : 0.38 }}>▶ TIMBRA ENTRATA</button>
                 </>
               )}
             </div>
           </div>
         )}
 
+        {/* MANUALE TAB */}
         {tab === "manual" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={{ background: "#EEF2FF", border: "1.5px solid #C7D2FE", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "#4338CA", fontFamily: "monospace", lineHeight: 1.5 }}>
               ✏️ La timbratura manuale non richiede GPS — sarà visibile al manager come "Manuale"
             </div>
-            <div>
-              <label style={S.label}>Data</label>
-              <input type="date" value={mDate} onChange={(e) => setMDate(e.target.value)} style={S.input} />
-            </div>
+            <div><label style={S.label}>Data</label><input type="date" value={mDate} onChange={e => setMDate(e.target.value)} style={S.input} /></div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-              <div><label style={S.label}>Entrata</label><input type="time" value={mIn} onChange={(e) => setMIn(e.target.value)} style={S.input} /></div>
-              <div><label style={S.label}>Uscita</label><input type="time" value={mOut} onChange={(e) => setMOut(e.target.value)} style={S.input} /></div>
+              <div><label style={S.label}>Entrata</label><input type="time" value={mIn} onChange={e => setMIn(e.target.value)} style={S.input} /></div>
+              <div><label style={S.label}>Uscita</label><input type="time" value={mOut} onChange={e => setMOut(e.target.value)} style={S.input} /></div>
             </div>
-            <button onClick={saveManual} disabled={saving} style={{ ...S.btnPrimary, opacity: saving ? 0.6 : 1 }}>
-              {saving ? "SALVATAGGIO…" : "SALVA TIMBRATURA"}
-            </button>
+            <div><label style={S.label}>Nota (opzionale)</label><input value={mNota} onChange={e => setMNota(e.target.value)} placeholder="es. trasferta, straordinario..." style={S.input} /></div>
+            <div>
+              <label style={S.label}>Categoria</label>
+              <select value={mCategoria} onChange={e => setMCategoria(e.target.value)} style={S.select}>
+                <option value="">— Seleziona categoria —</option>
+                <option value="Manutenzione del verde agriturismo">Manutenzione del verde agriturismo</option>
+                <option value="Cucina">Cucina</option>
+                <option value="Servizio evento">Servizio evento</option>
+                <option value="Preparazione carne">Preparazione carne</option>
+                <option value="Pulizie generali">Pulizie generali</option>
+                <option value="Giardino Giovanni">Giardino Giovanni</option>
+                <option value="Giardino Fabio">Giardino Fabio</option>
+                <option value="Giardino Villa">Giardino Villa</option>
+                <option value="Giardino Lorenzo">Giardino Lorenzo</option>
+                <option value="Giardino Tommaso">Giardino Tommaso</option>
+                <option value="Giardino Andrea">Giardino Andrea</option>
+                <option value="Giardino Adriano (Como)">Giardino Adriano (Como)</option>
+                <option value="Condominio via Diaz San Fermo">Condominio via Diaz San Fermo</option>
+                <option value="Consegne">Consegne</option>
+                <option value="Altro">Altro (Specificare)</option>
+              </select>
+              {mCategoria === "Altro" && (
+                <input value={mNota} onChange={e => setMNota(e.target.value)} placeholder="Specifica l'attività..." style={{ ...S.input, marginTop: 8 }} />
+              )}
+            </div>
+            <button onClick={saveManual} disabled={saving} style={{ ...S.btnPrimary, opacity: saving ? 0.6 : 1 }}>{saving ? "SALVATAGGIO…" : "SALVA TIMBRATURA"}</button>
           </div>
         )}
 
+        {/* STORICO TAB */}
         {tab === "history" && (
           <div>
-            {myEntries.length === 0
-              ? <div style={{ color: C.textMuted, textAlign: "center", padding: "28px 0", fontSize: 13, fontFamily: "monospace" }}>Nessuna timbratura</div>
+            {/* Selettore mese */}
+            <div style={{ marginBottom: 14 }}>
+              <label style={S.label}>Mese</label>
+              <input
+                type="month"
+                value={historyMonth}
+                onChange={e => setHistoryMonth(e.target.value)}
+                style={S.input}
+              />
+            </div>
+            {/* Totale mese */}
+            {recentEntries.length > 0 && (
+              <div style={{ background: C.accentLight, borderRadius: 10, padding: "10px 14px", marginBottom: 12, display: "flex", justifyContent: "space-between" }}>
+                <span style={{ fontSize: 12, color: C.accent, fontFamily: "monospace" }}>
+                  {recentEntries.length} timbrature
+                </span>
+                <span style={{ fontSize: 13, fontWeight: 700, color: C.accent, fontFamily: "monospace" }}>
+                  {formatDuration(recentEntries.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0))}
+                </span>
+              </div>
+            )}
+            {recentEntries.length === 0
+              ? <div style={{ color: C.textMuted, textAlign: "center", padding: "28px 0", fontSize: 13, fontFamily: "monospace" }}>Nessuna timbratura in questo mese</div>
               : <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {myEntries.map((e) => <EntryCard key={e.firebaseKey} entry={e} />)}
+                  {recentEntries.map(e => <EntryCard key={e.firebaseKey} entry={e} siblings={myEntries} />)}
                 </div>
             }
           </div>
@@ -366,177 +903,398 @@ function EmployeeView({ entries }) {
   );
 }
 
-function ManagerView({ entries }) {
-  const [pin, setPin] = useState("");
-  const [auth, setAuth] = useState(false);
-  const [fEmp, setFEmp] = useState("all");
-  const [fFrom, setFFrom] = useState("");
-  const [fTo, setFTo] = useState("");
-  const [pinErr, setPinErr] = useState(false);
+// ── DASHBOARD ──────────────────────────────────────────────
+function Dashboard({ entries, employees }) {
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+  const toDateStr = (d) => d.toISOString().slice(0, 10);
 
-  const check = () => { if (pin === MANAGER_PIN) { setAuth(true); setPinErr(false); } else { setPinErr(true); setPin(""); } };
+  const [fFrom, setFFrom] = useState(toDateStr(startOfMonth));
+  const [fTo, setFTo] = useState(toDateStr(endOfMonth));
+  const [fEmps, setFEmps] = useState([]);
+  const [fType, setFType] = useState("all");
+  const [fLuogo, setFLuogo] = useState("all");
 
-  const deleteEntry = async (firebaseKey) => {
-    await remove(ref(db, `timbrature/${firebaseKey}`));
-  };
+  useEffect(() => {
+    if (employees.length > 0 && fEmps.length === 0) setFEmps(employees.map(e => e.id));
+  }, [employees]);
 
-  const filtered = entries.filter((e) => {
-    if (fEmp !== "all" && e.employeeId !== fEmp) return false;
+  const toggleEmp = (id) => setFEmps(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+
+  const filtered = entries.filter(e => {
     if (fFrom && new Date(e.dateIn) < new Date(fFrom)) return false;
     if (fTo && new Date(e.dateIn) > new Date(fTo + "T23:59:59")) return false;
+    if (fEmps.length > 0 && !fEmps.includes(e.employeeId)) return false;
+    if (fType === "timer" && e.type !== "timer") return false;
+    if (fType === "manual" && e.type !== "manual") return false;
+    if (fLuogo !== "all" && e.categoria !== fLuogo) return false;
     return true;
-  }).sort((a, b) => new Date(b.dateIn) - new Date(a.dateIn));
-
-  const stats = EMPLOYEES.map((emp) => {
-    const es = filtered.filter((e) => e.employeeId === emp.id);
-    return { ...emp, count: es.length, totalMs: es.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0), timer: es.filter((e) => e.type === "timer").length, manual: es.filter((e) => e.type === "manual").length };
   });
 
   const totalMs = filtered.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
+  const timerMs = filtered.filter(e => e.type === "timer").reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
+  const manualMs = filtered.filter(e => e.type === "manual").reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
 
-  if (!auth) return (
-    <div style={S.card}>
-      <div style={S.eyebrow}>ACCESSO MANAGER</div>
-      <p style={{ color: C.textSub, fontSize: 13, marginBottom: 20 }}>Inserisci il PIN per accedere al pannello</p>
-      <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginBottom: 6 }}>Demo PIN: 1234</div>
-      <input type="password" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value)} onKeyDown={(e) => e.key === "Enter" && check()} placeholder="• • • •" style={{ ...S.input, textAlign: "center", fontSize: 30, letterSpacing: 14 }} />
-      {pinErr && <div style={{ color: C.danger, fontSize: 12, marginTop: 8 }}>PIN errato</div>}
-      <button onClick={check} style={{ ...S.btnPrimary, marginTop: 16 }}>ACCEDI</button>
-    </div>
-  );
+  const empStats = employees.map(emp => {
+    const es = filtered.filter(e => e.employeeId === emp.id);
+    const ms = es.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
+    const timerEs = es.filter(e => e.type === "timer");
+    const manualEs = es.filter(e => e.type === "manual");
+    return { ...emp, ms, count: es.length, timerCount: timerEs.length, manualCount: manualEs.length, timerMs: timerEs.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0), manualMs: manualEs.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0) };
+  }).sort((a, b) => b.ms - a.ms);
+
+  const periodLabel = fFrom + " / " + fTo;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <div style={S.card}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div>
-            <div style={S.eyebrow}>PANNELLO MANAGER</div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>Agostinelli</div>
-          </div>
-          <button onClick={() => setAuth(false)} style={S.btnGhost}>Esci</button>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}>
-          <div style={{ background: C.accentLight, borderRadius: 12, padding: "12px 14px" }}>
-            <div style={{ fontSize: 10, color: C.accent, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>ORE TOTALI</div>
-            <div style={{ fontSize: 24, fontWeight: 700, color: C.accent, fontFamily: "Georgia, serif" }}>{formatDuration(totalMs)}</div>
-          </div>
-          <div style={{ background: C.surfaceAlt, borderRadius: 12, padding: "12px 14px", border: `1.5px solid ${C.border}` }}>
-            <div style={{ fontSize: 10, color: C.textSub, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>TIMBRATURE</div>
-            <div style={{ fontSize: 24, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>{filtered.length}</div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, padding: "0 16px" }}>
-        {stats.map((s) => (
-          <div key={s.id} style={{ ...S.card, padding: 14 }}>
-            <div style={{ fontSize: 10, color: C.textMuted, fontFamily: "monospace", marginBottom: 4 }}>{s.name.split(" ")[0].toUpperCase()}</div>
-            <div style={{ fontSize: 19, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>{formatDuration(s.totalMs)}</div>
-            <div style={{ fontSize: 10, color: C.textSub, marginTop: 5, fontFamily: "monospace" }}>📍 {s.timer} · ✏️ {s.manual}</div>
-          </div>
-        ))}
-      </div>
-
+      {/* Filtri */}
       <div style={{ ...S.card, margin: "0 16px" }}>
-        <div style={S.eyebrow}>FILTRI</div>
-        <select value={fEmp} onChange={(e) => setFEmp(e.target.value)} style={{ ...S.select, marginBottom: 10 }}>
-          <option value="all">Tutti i dipendenti</option>
-          {EMPLOYEES.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
-        </select>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <div><label style={S.label}>Dal</label><input type="date" value={fFrom} onChange={(e) => setFFrom(e.target.value)} style={S.input} /></div>
-          <div><label style={S.label}>Al</label><input type="date" value={fTo} onChange={(e) => setFTo(e.target.value)} style={S.input} /></div>
+        <div style={S.eyebrow}>FILTRI REPORT</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+          <div><label style={S.label}>Dal</label><input type="date" value={fFrom} onChange={e => setFFrom(e.target.value)} style={S.input} /></div>
+          <div><label style={S.label}>Al</label><input type="date" value={fTo} onChange={e => setFTo(e.target.value)} style={S.input} /></div>
         </div>
-        {(fEmp !== "all" || fFrom || fTo) && (
-          <button onClick={() => { setFEmp("all"); setFFrom(""); setFTo(""); }} style={{ ...S.btnGhost, marginTop: 10, width: "100%" }}>
-            Reset filtri
-          </button>
-        )}
+        <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+          {[["Oggi", toDateStr(now), toDateStr(now)], ["Sett.", toDateStr(new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay() + 1)), toDateStr(now)], ["Mese", toDateStr(startOfMonth), toDateStr(endOfMonth)], ["Anno", now.getFullYear() + "-01-01", now.getFullYear() + "-12-31"]].map(([label, from, to]) => (
+            <button key={label} onClick={() => { setFFrom(from); setFTo(to); }} style={{ padding: "5px 12px", borderRadius: 20, fontSize: 11, fontFamily: "monospace", background: fFrom === from && fTo === to ? C.accent : C.surfaceAlt, color: fFrom === from && fTo === to ? "#fff" : C.textSub, border: "1.5px solid " + (fFrom === from && fTo === to ? C.accent : C.border), cursor: "pointer", fontWeight: 600 }}>{label}</button>
+          ))}
+        </div>
+        <label style={S.label}>Tipo</label>
+        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+          {[["all", "Tutte"], ["timer", "📍 GPS"], ["manual", "✏️ Manuali"]].map(([val, label]) => (
+            <button key={val} onClick={() => setFType(val)} style={{ flex: 1, padding: "8px 4px", borderRadius: 8, fontSize: 11, fontFamily: "monospace", background: fType === val ? C.accent : C.surfaceAlt, color: fType === val ? "#fff" : C.textSub, border: "1.5px solid " + (fType === val ? C.accent : C.border), cursor: "pointer", fontWeight: 600 }}>{label}</button>
+          ))}
+        </div>
+        <label style={S.label}>Categoria</label>
+        <div style={{ marginBottom: 14 }}>
+          <select value={fLuogo} onChange={e => setFLuogo(e.target.value)} style={S.select}>
+            <option value="all">Tutte le categorie</option>
+            <option value="Manutenzione del verde agriturismo">Manutenzione del verde agriturismo</option>
+            <option value="Cucina">Cucina</option>
+            <option value="Servizio evento">Servizio evento</option>
+            <option value="Preparazione carne">Preparazione carne</option>
+            <option value="Pulizie generali">Pulizie generali</option>
+            <option value="Giardino Giovanni">Giardino Giovanni</option>
+            <option value="Giardino Fabio">Giardino Fabio</option>
+            <option value="Giardino Villa">Giardino Villa</option>
+            <option value="Giardino Lorenzo">Giardino Lorenzo</option>
+            <option value="Giardino Tommaso">Giardino Tommaso</option>
+            <option value="Giardino Andrea">Giardino Andrea</option>
+            <option value="Giardino Adriano (Como)">Giardino Adriano (Como)</option>
+            <option value="Condominio via Diaz San Fermo">Condominio via Diaz San Fermo</option>
+            <option value="Consegne">Consegne</option>
+            <option value="Altro">Altro</option>
+          </select>
+        </div>
+        <label style={S.label}>Dipendenti</label>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {employees.map(emp => (
+            <button key={emp.id} onClick={() => toggleEmp(emp.id)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, textAlign: "left", background: fEmps.includes(emp.id) ? C.accentLight : C.surfaceAlt, border: "1.5px solid " + (fEmps.includes(emp.id) ? C.accent : C.border), cursor: "pointer" }}>
+              <div style={{ width: 18, height: 18, borderRadius: 4, background: fEmps.includes(emp.id) ? C.accent : C.surface, border: "1.5px solid " + (fEmps.includes(emp.id) ? C.accent : C.borderStrong), display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                {fEmps.includes(emp.id) && <span style={{ color: "#fff", fontSize: 11, fontWeight: 700 }}>✓</span>}
+              </div>
+              <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{emp.nome} {emp.cognome}</span>
+            </button>
+          ))}
+          {employees.length === 0 && <div style={{ color: C.textMuted, fontSize: 12, fontFamily: "monospace" }}>Nessun dipendente registrato</div>}
+        </div>
       </div>
 
-      <div style={{ padding: "0 16px" }}>
-        <div style={{ ...S.eyebrow, marginBottom: 10 }}>{filtered.length} TIMBRATURE</div>
-        {filtered.length === 0
-          ? <div style={{ background: C.surface, borderRadius: 12, padding: 28, textAlign: "center", color: C.textMuted, fontSize: 13, fontFamily: "monospace", border: `1.5px solid ${C.border}` }}>Nessuna timbratura trovata</div>
-          : <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {filtered.map((e) => <EntryCard key={e.firebaseKey} entry={e} onDelete={deleteEntry} />)}
+      {/* Totale */}
+      <div style={{ ...S.card, margin: "0 16px", background: C.accent }}>
+        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.7)", fontFamily: "monospace", letterSpacing: 2, marginBottom: 6 }}>ORE TOTALI NEL PERIODO</div>
+        <div style={{ fontSize: 36, fontWeight: 700, color: "#fff", fontFamily: "Georgia, serif", marginBottom: 4 }}>{formatDuration(totalMs)}</div>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+          <div><div style={{ fontSize: 10, color: "rgba(255,255,255,0.6)", fontFamily: "monospace" }}>TIMBRATURE</div><div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>{filtered.length}</div></div>
+          {timerMs > 0 && fType !== "manual" && <div><div style={{ fontSize: 10, color: "rgba(255,255,255,0.6)", fontFamily: "monospace" }}>📍 GPS</div><div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>{formatDuration(timerMs)}</div></div>}
+          {manualMs > 0 && fType !== "timer" && <div><div style={{ fontSize: 10, color: "rgba(255,255,255,0.6)", fontFamily: "monospace" }}>✏️ MANUALI</div><div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>{formatDuration(manualMs)}</div></div>}
+        </div>
+      </div>
+
+      {/* Export */}
+      <div style={{ ...S.card, margin: "0 16px" }}>
+        <div style={S.eyebrow}>ESPORTA</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <button onClick={() => exportCSV(filtered, employees, "timbrature-" + fFrom + "_" + fTo)} style={{ padding: "12px", background: C.accentLight, border: "1.5px solid " + C.accent, borderRadius: 12, color: C.accent, fontSize: 12, fontWeight: 700, fontFamily: "monospace", cursor: "pointer" }}>
+            📊 Excel / CSV
+          </button>
+          <button onClick={() => exportPDF(filtered, periodLabel)} style={{ padding: "12px", background: "#EEF2FF", border: "1.5px solid #C7D2FE", borderRadius: 12, color: "#4338CA", fontSize: 12, fontWeight: 700, fontFamily: "monospace", cursor: "pointer" }}>
+            🖨️ Stampa / PDF
+          </button>
+        </div>
+      </div>
+
+      {/* Dettaglio per dipendente */}
+      <div style={{ ...S.card, margin: "0 16px" }}>
+        <div style={S.eyebrow}>DETTAGLIO PER DIPENDENTE</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {empStats.filter(s => fEmps.includes(s.id)).map((s, i, arr) => (
+            <div key={s.id} style={{ padding: "14px 0", borderBottom: i < arr.length - 1 ? "1px solid " + C.border : "none" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{s.nome} {s.cognome}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace" }}>{s.email}</div>
+                </div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: s.ms > 0 ? C.accent : C.textMuted, fontFamily: "Georgia, serif" }}>{formatDuration(s.ms)}</div>
+              </div>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 6 }}>
+                <span style={{ fontSize: 11, color: C.textSub, fontFamily: "monospace" }}>{s.count} timbrature</span>
+                {s.timerCount > 0 && <span style={{ fontSize: 11, color: C.accent, fontFamily: "monospace" }}>📍 {s.timerCount} GPS · {formatDuration(s.timerMs)}</span>}
+                {s.manualCount > 0 && <span style={{ fontSize: 11, color: "#4338CA", fontFamily: "monospace" }}>✏️ {s.manualCount} manuali · {formatDuration(s.manualMs)}</span>}
+              </div>
             </div>
-        }
+          ))}
+          {filtered.length === 0 && <div style={{ color: C.textMuted, textAlign: "center", padding: "20px 0", fontSize: 13, fontFamily: "monospace" }}>Nessun dato nel periodo</div>}
+        </div>
       </div>
     </div>
   );
 }
 
-export default function App() {
-  const [view, setView] = useState("employee");
+// ── MANAGER VIEW ───────────────────────────────────────────
+function ManagerView({ user }) {
+  const isManager = isManagerUser(user);
   const [entries, setEntries] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [employees, setEmployees] = useState([]);
+  const [showOverlaps, setShowOverlaps] = useState(false);
+  const [tab, setTab] = useState("dashboard");
+  const [fEmp, setFEmp] = useState("all");
+  const [fFrom, setFFrom] = useState("");
+  const [fTo, setFTo] = useState("");
+  const [fLuogoM, setFLuogoM] = useState("all");
+  const [confirmDelete, setConfirmDelete] = useState(null);
 
   useEffect(() => {
-    const entriesRef = ref(db, "timbrature");
-    const unsub = onValue(entriesRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data) {
-        const list = Object.entries(data).map(([key, val]) => ({ ...val, firebaseKey: key }));
-        setEntries(list);
-      } else {
-        setEntries([]);
-      }
-      setLoading(false);
-    });
-    return () => unsub();
-  }, []);
+    if (!isManager) return;
+    const u1 = onValue(ref(db, "timbrature"), snap => { const d = snap.val(); setEntries(d ? Object.entries(d).map(([k, v]) => ({ ...v, firebaseKey: k })) : []); });
+    const u2 = onValue(ref(db, "employees"), snap => { const d = snap.val(); setEmployees(d ? Object.entries(d).map(([k, v]) => ({ ...v, id: k })) : []); });
+    return () => { u1(); u2(); };
+  }, [isManager]);
+
+  const deleteEntry = async (key) => { await remove(ref(db, "timbrature/" + key)); };
+  const deleteEmployee = async (id) => { await remove(ref(db, "employees/" + id)); };
+
+  const filtered = entries.filter(e => {
+    if (fEmp !== "all" && e.employeeId !== fEmp) return false;
+    if (fFrom && new Date(e.dateIn) < new Date(fFrom)) return false;
+    if (fTo && new Date(e.dateIn) > new Date(fTo + "T23:59:59")) return false;
+    if (fLuogoM !== "all" && e.categoria !== fLuogoM) return false;
+    return true;
+  }).sort((a, b) => new Date(b.dateIn) - new Date(a.dateIn));
+
+  const totalMs = filtered.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
+
+  const overlaps = listOverlaps(entries);
+
+  const wrap = (child) => <div style={{ padding: "0 16px" }}>{child}</div>;
+  if (!user) return wrap(<AuthScreen eyebrow="ACCESSO MANAGER" title="Accedi" />);
+  if (!user.emailVerified) return wrap(<VerifyEmailScreen user={user} />);
+  if (!isManager) return wrap(
+    <div style={S.card}>
+      <div style={S.eyebrow}>ACCESSO MANAGER</div>
+      <p style={{ color: C.textSub, fontSize: 13, lineHeight: 1.6, marginBottom: 16 }}>L'account <strong>{user.email}</strong> non è abilitato al pannello manager.</p>
+      <button onClick={() => signOut(auth)} style={S.btnGhost}>Esci</button>
+    </div>
+  );
 
   return (
-    <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 48 }}>
-      <style>{`
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'DM Sans', sans-serif; }
-        select, input { outline: none; }
-        select:focus, input:focus { border-color: ${C.accent} !important; box-shadow: 0 0 0 3px ${C.accentLight}; }
-        button:active { transform: scale(0.97); }
-      `}</style>
+    <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+      {confirmDelete && <ConfirmModal title={confirmDelete.type === "employee" ? "Elimina dipendente" : "Elimina timbratura"} message={confirmDelete.type === "employee" ? "Vuoi eliminare questo dipendente?" : "Sei sicuro di voler eliminare questa timbratura?"} onConfirm={() => { confirmDelete.action(); setConfirmDelete(null); }} onCancel={() => setConfirmDelete(null)} />}
 
-      <div style={{ background: C.surface, borderBottom: `1.5px solid ${C.border}`, padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 50, boxShadow: "0 1px 8px rgba(0,0,0,0.06)" }}>
-        <div>
-          <div style={{ fontSize: 9, color: C.accent, letterSpacing: 3, fontFamily: "monospace", fontWeight: 700 }}>AGOSTINELLI</div>
-          <div style={{ fontSize: 22, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>Timbrature</div>
+      {/* Banner promemoria lunedì */}
+      {new Date().getDay() === 1 && (
+        <div style={{ margin: "0 16px 12px", background: C.warnLight, border: "1.5px solid " + C.warn, borderRadius: 14, padding: "14px 16px", display: "flex", gap: 12, alignItems: "center" }}>
+          <span style={{ fontSize: 24 }}>📊</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, color: C.warn, fontSize: 13, marginBottom: 2 }}>È lunedì — esporta il report settimanale!</div>
+            <div style={{ fontSize: 11, color: C.textSub }}>Vai su Report → Excel/CSV per scaricare le timbrature della settimana scorsa.</div>
+          </div>
+          <button onClick={() => { setTab("dashboard"); }} style={{ padding: "8px 12px", background: C.warn, border: "none", borderRadius: 10, color: "#fff", fontSize: 11, fontWeight: 700, fontFamily: "monospace", cursor: "pointer", whiteSpace: "nowrap" }}>
+            Vai ai Report
+          </button>
         </div>
-        <Clock />
+      )}
+
+      <div style={{ ...S.card, margin: "0 16px", marginBottom: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={S.eyebrow}>PANNELLO MANAGER</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>Agostinelli</div>
+          </div>
+          <button onClick={() => signOut(auth)} style={S.btnGhost}>Esci</button>
+        </div>
       </div>
 
-      <div style={{ padding: "16px 16px 0" }}>
-        <div style={{ display: "flex", background: C.surface, borderRadius: 12, border: `1.5px solid ${C.border}`, overflow: "hidden" }}>
-          {[["employee", "👤 Dipendente"], ["manager", "🔑 Manager"]].map(([k, l]) => (
-            <button key={k} onClick={() => setView(k)} style={{ flex: 1, padding: "11px 8px", background: view === k ? C.accent : "transparent", border: "none", color: view === k ? "#fff" : C.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
-              {l}
-            </button>
+      <div style={{ padding: "0 16px", marginBottom: 12 }}>
+        <div style={S.tabs}>
+          {[["dashboard", "📊 Report"], ["timbrature", "📋 Timbrature"], ["dipendenti", "👥 Dipendenti"]].map(([k, l]) => (
+            <button key={k} onClick={() => setTab(k)} style={tab === k ? S.tabOn : S.tabOff}>{l}</button>
           ))}
         </div>
       </div>
 
-      {loading ? (
-        <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontFamily: "monospace", fontSize: 13 }}>
-          Connessione a Firebase…
+      {tab === "dashboard" && <Dashboard entries={entries} employees={employees} />}
+
+      {tab === "timbrature" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, padding: "0 16px" }}>
+            <div style={{ background: C.accentLight, borderRadius: 12, padding: "12px 14px" }}>
+              <div style={{ fontSize: 10, color: C.accent, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>ORE TOTALI</div>
+              <div style={{ fontSize: 24, fontWeight: 700, color: C.accent, fontFamily: "Georgia, serif" }}>{formatDuration(totalMs)}</div>
+            </div>
+            <div style={{ background: C.surfaceAlt, borderRadius: 12, padding: "12px 14px", border: "1.5px solid " + C.border }}>
+              <div style={{ fontSize: 10, color: C.textSub, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>TIMBRATURE</div>
+              <div style={{ fontSize: 24, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>{filtered.length}</div>
+            </div>
+          </div>
+          {overlaps.length > 0 && (
+            <div style={{ margin: "0 16px", background: C.dangerLight, border: "1.5px solid " + C.danger + "60", borderRadius: 14, padding: "12px 14px" }}>
+              <button onClick={() => setShowOverlaps(v => !v)} style={{ width: "100%", background: "none", border: "none", padding: 0, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", color: C.danger, fontSize: 13, fontWeight: 700 }}>
+                <span>⚠️ {overlaps.length} sovrapposizion{overlaps.length === 1 ? "e" : "i"} da correggere</span>
+                <span>{showOverlaps ? "▲" : "▼"}</span>
+              </button>
+              {showOverlaps && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
+                  {overlaps.map(([a, b]) => (
+                    <div key={a.firebaseKey + b.firebaseKey} style={{ background: C.surface, borderRadius: 10, padding: "8px 10px", fontSize: 11, fontFamily: "monospace", color: C.textSub }}>
+                      <div style={{ fontWeight: 700, color: C.text, marginBottom: 3 }}>{a.employeeName} · {formatDate(a.dateIn)}</div>
+                      <div>{formatTime(a.dateIn)} → {formatTime(a.dateOut)} ({a.type === "manual" ? "manuale" : "timer"})</div>
+                      <div>{formatTime(b.dateIn)} → {formatTime(b.dateOut)} ({b.type === "manual" ? "manuale" : "timer"})</div>
+                    </div>
+                  ))}
+                  <div style={{ fontSize: 11, color: C.textSub }}>Correggi o elimina una delle due dalla lista qui sotto (filtra per dipendente e data).</div>
+                </div>
+              )}
+            </div>
+          )}
+          <div style={{ ...S.card, margin: "0 16px" }}>
+            <div style={S.eyebrow}>FILTRI</div>
+            <select value={fEmp} onChange={e => setFEmp(e.target.value)} style={{ ...S.select, marginBottom: 10 }}>
+              <option value="all">Tutti i dipendenti</option>
+              {employees.map(e => <option key={e.id} value={e.id}>{e.nome} {e.cognome}</option>)}
+            </select>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div><label style={S.label}>Dal</label><input type="date" value={fFrom} onChange={e => setFFrom(e.target.value)} style={S.input} /></div>
+              <div><label style={S.label}>Al</label><input type="date" value={fTo} onChange={e => setFTo(e.target.value)} style={S.input} /></div>
+            </div>
+            {(fEmp !== "all" || fFrom || fTo || fLuogoM !== "all") && <button onClick={() => { setFEmp("all"); setFFrom(""); setFTo(""); setFLuogoM("all"); }} style={{ ...S.btnGhost, marginTop: 10, width: "100%" }}>Reset filtri</button>}
+            <div style={{ marginTop: 12 }}>
+              <label style={S.label}>Categoria</label>
+              <select value={fLuogoM} onChange={e => setFLuogoM(e.target.value)} style={S.select}>
+                <option value="all">Tutte le categorie</option>
+                <option value="Manutenzione del verde agriturismo">Manutenzione del verde agriturismo</option>
+                <option value="Cucina">Cucina</option>
+                <option value="Servizio evento">Servizio evento</option>
+                <option value="Preparazione carne">Preparazione carne</option>
+                <option value="Pulizie generali">Pulizie generali</option>
+                <option value="Giardino Giovanni">Giardino Giovanni</option>
+                <option value="Giardino Fabio">Giardino Fabio</option>
+                <option value="Giardino Villa">Giardino Villa</option>
+                <option value="Giardino Lorenzo">Giardino Lorenzo</option>
+                <option value="Giardino Tommaso">Giardino Tommaso</option>
+                <option value="Giardino Andrea">Giardino Andrea</option>
+                <option value="Giardino Adriano (Como)">Giardino Adriano (Como)</option>
+                <option value="Condominio via Diaz San Fermo">Condominio via Diaz San Fermo</option>
+                <option value="Consegne">Consegne</option>
+                <option value="Altro">Altro</option>
+              </select>
+            </div>
+          </div>
+          <div style={{ ...S.card, margin: "0 16px" }}>
+            <div style={S.eyebrow}>ESPORTA</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <button onClick={() => exportCSV(filtered, employees, "timbrature")} style={{ padding: "12px", background: C.accentLight, border: "1.5px solid " + C.accent, borderRadius: 12, color: C.accent, fontSize: 12, fontWeight: 700, fontFamily: "monospace", cursor: "pointer" }}>📊 Excel / CSV</button>
+              <button onClick={() => exportPDF(filtered, "Timbrature")} style={{ padding: "12px", background: "#EEF2FF", border: "1.5px solid #C7D2FE", borderRadius: 12, color: "#4338CA", fontSize: 12, fontWeight: 700, fontFamily: "monospace", cursor: "pointer" }}>🖨️ PDF</button>
+            </div>
+          </div>
+          <div style={{ padding: "0 16px" }}>
+            <div style={{ ...S.eyebrow, marginBottom: 10 }}>{filtered.length} TIMBRATURE</div>
+            {filtered.length === 0
+              ? <div style={{ background: C.surface, borderRadius: 12, padding: 28, textAlign: "center", color: C.textMuted, fontSize: 13, fontFamily: "monospace", border: "1.5px solid " + C.border }}>Nessuna timbratura trovata</div>
+              : <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {filtered.map(e => <EntryCard key={e.firebaseKey} entry={e} siblings={entries.filter(x => x.employeeId === e.employeeId)} onDelete={(key) => setConfirmDelete({ type: "timbratura", action: () => deleteEntry(key) })} />)}
+                </div>
+            }
+          </div>
         </div>
-      ) : (
-        <div style={{ padding: view === "manager" ? "16px 0 0" : "16px" }}>
-          {view === "employee" ? <EmployeeView entries={entries} /> : <ManagerView entries={entries} />}
+      )}
+
+      {tab === "dipendenti" && (
+        <div style={{ padding: "0 16px" }}>
+          <div style={{ ...S.eyebrow, marginBottom: 10 }}>{employees.length} DIPENDENTI REGISTRATI</div>
+          {employees.length === 0
+            ? <div style={{ background: C.surface, borderRadius: 12, padding: 28, textAlign: "center", color: C.textMuted, fontSize: 13, fontFamily: "monospace", border: "1.5px solid " + C.border }}>Nessun dipendente registrato</div>
+            : <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {employees.map(emp => {
+                  const empEntries = entries.filter(e => e.employeeId === emp.id);
+                  const totalMs = empEntries.reduce((s, e) => s + (new Date(e.dateOut) - new Date(e.dateIn)), 0);
+                  return (
+                    <div key={emp.id} style={{ background: C.surface, borderRadius: 12, padding: "14px 15px", border: "1.5px solid " + C.border }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                        <div>
+                          <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{emp.nome} {emp.cognome}</div>
+                          <div style={{ fontSize: 11, color: C.textMuted, fontFamily: "monospace", marginTop: 2 }}>{emp.email}</div>
+                          <div style={{ fontSize: 11, color: C.textSub, fontFamily: "monospace", marginTop: 4 }}>{empEntries.length} timbrature · {formatDuration(totalMs)}</div>
+                        </div>
+                        <button onClick={() => setConfirmDelete({ type: "employee", action: () => deleteEmployee(emp.id) })} style={{ padding: "5px 10px", background: C.dangerLight, border: "1px solid " + C.danger + "40", borderRadius: 8, color: C.danger, fontSize: 11, cursor: "pointer", fontFamily: "monospace" }}>Rimuovi</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+          }
         </div>
       )}
     </div>
   );
 }
 
+// ── APP ────────────────────────────────────────────────────
+export default function App() {
+  const [view, setView] = useState("employee");
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => onAuthStateChanged(auth, u => { setUser(u); setLoading(false); }), []);
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, paddingBottom: 48 }}>
+      <style>{"* { box-sizing: border-box; margin: 0; padding: 0; } select, input { outline: none; } select:focus, input:focus { border-color: " + C.accent + " !important; box-shadow: 0 0 0 3px " + C.accentLight + "; } button:active { transform: scale(0.97); }"}</style>
+      <div style={{ background: C.surface, borderBottom: "1.5px solid " + C.border, padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 50, boxShadow: "0 1px 8px rgba(0,0,0,0.06)" }}>
+        <div>
+          <div style={{ fontSize: 9, color: C.accent, letterSpacing: 3, fontFamily: "monospace", fontWeight: 700 }}>AGRITURISMO AGOSTINELLI</div>
+          <div style={{ fontSize: 22, fontWeight: 700, color: C.text, fontFamily: "Georgia, serif" }}>Timbrature</div>
+        </div>
+        <Clock />
+      </div>
+      <div style={{ padding: "16px 16px 0" }}>
+        <div style={{ display: "flex", background: C.surface, borderRadius: 12, border: "1.5px solid " + C.border, overflow: "hidden" }}>
+          {[["employee", "👤 Dipendente"], ["manager", "🔑 Manager"]].map(([k, l]) => (
+            <button key={k} onClick={() => setView(k)} style={{ flex: 1, padding: "11px 8px", background: view === k ? C.accent : "transparent", border: "none", color: view === k ? "#fff" : C.textSub, fontSize: 13, fontWeight: 600, cursor: "pointer", transition: "all 0.18s" }}>{l}</button>
+          ))}
+        </div>
+      </div>
+      {loading
+        ? <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontFamily: "monospace", fontSize: 13 }}>Connessione…</div>
+        : <div style={{ padding: view === "manager" ? "16px 0 0" : "16px" }}>
+            {view === "employee" ? <EmployeeView key={user ? user.uid : "anon"} user={user} /> : <ManagerView user={user} />}
+          </div>
+      }
+    </div>
+  );
+}
+
 const S = {
-  card: { background: C.surface, borderRadius: 16, padding: 20, border: `1.5px solid ${C.border}`, boxShadow: "0 1px 6px rgba(0,0,0,0.05)" },
+  card: { background: C.surface, borderRadius: 16, padding: 20, border: "1.5px solid " + C.border, boxShadow: "0 1px 6px rgba(0,0,0,0.05)" },
   eyebrow: { fontSize: 9, color: C.accent, letterSpacing: 3, fontFamily: "monospace", fontWeight: 700, marginBottom: 6, textTransform: "uppercase" },
   label: { display: "block", fontSize: 10, color: C.textSub, letterSpacing: 1.5, marginBottom: 6, fontFamily: "monospace", textTransform: "uppercase" },
-  input: { width: "100%", padding: "10px 12px", background: C.surfaceAlt, border: `1.5px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14, colorScheme: "light" },
-  select: { width: "100%", padding: "10px 12px", background: C.surfaceAlt, border: `1.5px solid ${C.border}`, borderRadius: 10, color: C.text, fontSize: 14 },
+  input: { width: "100%", padding: "10px 12px", background: C.surfaceAlt, border: "1.5px solid " + C.border, borderRadius: 10, color: C.text, fontSize: 14, colorScheme: "light" },
+  select: { width: "100%", padding: "10px 12px", background: C.surfaceAlt, border: "1.5px solid " + C.border, borderRadius: 10, color: C.text, fontSize: 14 },
   btnPrimary: { width: "100%", padding: "13px", background: C.accent, border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, fontFamily: "monospace", cursor: "pointer", letterSpacing: 1.5 },
   btnDanger: { width: "100%", padding: "13px", background: C.danger, border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, fontFamily: "monospace", cursor: "pointer", letterSpacing: 1.5 },
-  btnGhost: { padding: "7px 16px", background: "transparent", border: `1.5px solid ${C.border}`, borderRadius: 8, color: C.textSub, fontSize: 12, fontFamily: "monospace", cursor: "pointer" },
-  tabs: { display: "flex", gap: 4, marginBottom: 20, background: C.surfaceAlt, borderRadius: 10, padding: 4 },
+  btnGhost: { padding: "7px 16px", background: "transparent", border: "1.5px solid " + C.border, borderRadius: 8, color: C.textSub, fontSize: 12, fontFamily: "monospace", cursor: "pointer" },
+  tabs: { display: "flex", gap: 4, marginBottom: 0, background: C.surfaceAlt, borderRadius: 10, padding: 4 },
   tabOn: { flex: 1, padding: "8px 4px", background: C.surface, border: "none", color: C.accent, fontSize: 11, cursor: "pointer", fontFamily: "monospace", fontWeight: 700, borderRadius: 7, boxShadow: "0 1px 4px rgba(0,0,0,0.1)" },
   tabOff: { flex: 1, padding: "8px 4px", background: "transparent", border: "none", color: C.textSub, fontSize: 11, cursor: "pointer", fontFamily: "monospace", borderRadius: 7 },
 };
